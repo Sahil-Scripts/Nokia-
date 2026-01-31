@@ -1,0 +1,33 @@
+{
+  "meta": {
+    "system": "Fronthaul Capacity Estimator v2.0",
+    "timestamp": "2026-01-31T22:50:34+0530",
+    "execution_time_sec": 4.07
+  },
+  "total_cells_processed": 9,
+  "link_results": {
+    "Link_1": {
+      "average_gbps": 0.03,
+      "peak_gbps": 2.32,
+      "required_99_percentile_gbps": 1.15,
+      "required_with_buffer_gbps": 0.9,
+      "overprovision_if_peak_based_percent": 50.3
+    },
+    "Link_2": {
+      "average_gbps": 0.03,
+      "peak_gbps": 2.32,
+      "required_99_percentile_gbps": 1.15,
+      "required_with_buffer_gbps": 0.9,
+      "overprovision_if_peak_based_percent": 50.3
+    },
+    "Link_3": {
+      "average_gbps": 0.02,
+      "peak_gbps": 1.76,
+      "required_99_percentile_gbps": 0.59,
+      "required_with_buffer_gbps": 0.46,
+      "overprovision_if_peak_based_percent": 66.4
+    }
+  },
+  "telecom_explanation": "This capacity is derived using slot-level statistical multiplexing analysis with percentile-based provisioning and buffer-aware congestion modeling to ensure <=1% slot loss compliance while minimizing over-dimensioning.",
+  "cost_analysis_summary": "Peak-based dimensioning leads to significant capex waste. By using 99th percentile dimensioning, we avoid ~55.7% over-provisioning. Adding a modest 4-symbol buffer further reduces capacity requirements by absorbing micro-bursts."
+}
