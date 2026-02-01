@@ -16,6 +16,8 @@ from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from topology_optimizer import optimize_topology, calculate_topology_cost
+import simulation_utils as sim_utils
+import networkx as nx
 
 # --- NOKIA BRANDING & STYLING ---
 st.set_page_config(
@@ -141,24 +143,27 @@ SLOT_DURATION_SEC = 0.0005
 SYMBOL_DURATION_SEC = 35.7e-6
 GBPS_SCALE = 1e9
 
-# Link Speed Options (Gbps)
-LINK_SPEEDS = [1, 10, 25, 40, 100]
+# Link Speed Options (Gbps) - Aligned with Nokia AirScale & 7250 IXR capabilities
+LINK_SPEEDS = [1, 2.5, 5, 10, 25, 40, 50, 100, 400]
 
 # CAPEX Cost Estimates (INR per link - Typical Operator Pricing in India)
-# Approx conversion ~85 INR/USD + taxes
 LINK_COSTS = {
     1: 45000,
+    2.5: 85000,
+    5: 125000,
     10: 170000,
     25: 680000,
     40: 1275000,
-    100: 2975000
+    50: 1500000,
+    100: 2975000,
+    400: 8500000
 }
 
 # Default Topology
 DEFAULT_MAPPING = {
-    2: "Link_1", 3: "Link_1", 4: "Link_1",
-    5: "Link_2", 6: "Link_2", 7: "Link_2",
-    8: "Link_3", 9: "Link_3", 10: "Link_3"
+    1: "Link_1", 2: "Link_1", 3: "Link_1", 4: "Link_1", 5: "Link_1", 6: "Link_1", 7: "Link_1", 8: "Link_1",
+    9: "Link_2", 10: "Link_2", 11: "Link_2", 12: "Link_2", 13: "Link_2", 14: "Link_2", 15: "Link_2", 16: "Link_2",
+    17: "Link_3", 18: "Link_3", 19: "Link_3", 20: "Link_3", 21: "Link_3", 22: "Link_3", 23: "Link_3", 24: "Link_3"
 }
 
 # --- CORE ALGORITHMS ---
@@ -171,20 +176,133 @@ def load_data(uploaded_files):
     for i, file_obj in enumerate(uploaded_files):
         try:
             filename = file_obj.name
-            cell_id = int(filename.replace("throughput-cell-", "").replace(".dat", ""))
-            df = pd.read_csv(file_obj, sep=r'\s+', names=["time", "bits"], engine='c')
-            df['cell_id'] = cell_id
-            data_frames.append(df)
-        except:
-            st.warning(f"⚠️ Skipped {file_obj.name}")
+            
+            # Detect file type
+            if "throughput" in filename:
+                # Format: time bits
+                cell_id_str = filename.replace("throughput-cell-", "").replace(".dat", "")
+                cell_id = int(cell_id_str)
+                df = pd.read_csv(file_obj, sep=r'\s+', names=["time", "bits"], engine='c')
+                df['cell_id'] = cell_id
+                df['type'] = 'throughput'
+                data_frames.append(df)
+            elif "packet" in filename or "pkt" in filename:
+                # Handle extended packet stats
+                # Expected format options:
+                # 1. Simple: slot_idx, packet_loss
+                # 2. Detailed: slot, txPackets, rxPackets, tooLateRxPackets, buffer_occupancy
+                
+                import re
+                match = re.search(r"cell[-_]?(\d+)", filename)
+                if match:
+                    cell_id = int(match.group(1))
+                    
+                    # Try reading strictly to inspect columns
+                    try:
+                        temp_df = pd.read_csv(file_obj, sep=r'\s+', engine='c')
+                        if len(temp_df.columns) >= 4: # Assume detailed
+                            # Determine column names based on width or header presence
+                            # If no header, assume standard telecom format: 
+                            # time/slot, tx, rx, too_late, (optional: buffer)
+                            if 'tooLateRxPackets' not in temp_df.columns:
+                                if len(temp_df.columns) == 5:
+                                    temp_df.columns = ["slot_idx", "txPackets", "rxPackets", "tooLateRxPackets", "buffer_occupancy"]
+                                elif len(temp_df.columns) == 4:
+                                    temp_df.columns = ["slot_idx", "txPackets", "rxPackets", "tooLateRxPackets"]
+                            
+                            temp_df['cell_id'] = cell_id
+                            temp_df['type'] = 'detailed_stats'
+                            data_frames.append(temp_df)
+                        else:
+                            # Fallback to simple loss format
+                            # Reset file pointer if needed, but here we read into temp_df
+                            temp_df.columns = ["slot_idx", "packet_loss"]
+                            temp_df['cell_id'] = cell_id
+                            temp_df['type'] = 'packet_loss'
+                            data_frames.append(temp_df)
+                    except:
+                        # Fallback for simple files (no header, 2 cols)
+                        file_obj.seek(0)
+                        df = pd.read_csv(file_obj, sep=r'\s+', names=["slot_idx", "packet_loss"], engine='c')
+                        df['cell_id'] = cell_id
+                        df['type'] = 'packet_loss'
+                        data_frames.append(df)
+                    
+        except Exception as e:
+            st.warning(f"⚠️ Skipped {file_obj.name}: {str(e)}")
         progress_bar.progress((i + 1) / len(uploaded_files))
     
     progress_bar.empty()
     if not data_frames: return None
     
-    full_df = pd.concat(data_frames, ignore_index=True)
-    min_time = full_df['time'].min()
-    full_df['slot_idx'] = ((full_df['time'] - min_time) / SLOT_DURATION_SEC).astype(int)
+    # Process Different Frames
+    tp_frames = [d for d in data_frames if d['type'].iloc[0] == 'throughput']
+    pl_frames = [d for d in data_frames if d['type'].iloc[0] == 'packet_loss']
+    detailed_frames = [d for d in data_frames if d['type'].iloc[0] == 'detailed_stats']
+    
+    full_df = None
+    
+    # Base Traffic Data
+    if tp_frames:
+        full_df = pd.concat(tp_frames, ignore_index=True)
+        min_time = full_df['time'].min()
+        full_df['slot_idx'] = ((full_df['time'] - min_time) / SLOT_DURATION_SEC).astype(int)
+    
+    # Integrate Detailed Stats (Priority)
+    if detailed_frames:
+        det_df = pd.concat(detailed_frames, ignore_index=True)
+        # Sort by slot
+        det_df = det_df.sort_values('slot_idx')
+        
+        # --- SYSTEMATIC CONGESTION DETECTION LOGIC ---
+        # 1. Calculate Deltas (since counters accumulate)
+        # Group by cell to ensure diff is valid
+        # If data is NOT cumulative (i.e. per slot), skip diff. 
+        # Heuristic: if values always increase, it's cumulative.
+        is_cumulative = det_df.groupby('cell_id')['rxPackets'].is_monotonic_increasing.all()
+        
+        if is_cumulative:
+            cols_to_diff = ['txPackets', 'rxPackets', 'tooLateRxPackets']
+            det_df[cols_to_diff] = det_df.groupby('cell_id')[cols_to_diff].diff().fillna(method='bfill')
+            
+        # 2. Compute Ratios
+        # Avoid division by zero
+        det_df['late_ratio'] = det_df['tooLateRxPackets'] / det_df['rxPackets'].replace(0, 1)
+        det_df['loss_ratio'] = (det_df['txPackets'] - det_df['rxPackets']) / det_df['txPackets'].replace(0, 1)
+        
+        # 3. Congestion Score
+        # Weighting: 0.6 * Late + 0.3 * Loss + 0.1 * NormalizedLoad (Simplified)
+        det_df['congestion_score'] = (0.6 * det_df['late_ratio']) + (0.3 * det_df['loss_ratio'].clip(lower=0))
+        
+        if full_df is not None:
+             full_df = pd.merge(full_df, det_df, on=['cell_id', 'slot_idx'], how='outer')
+        else:
+             # Construct base if no throughput file
+             full_df = det_df
+             full_df['time'] = full_df['slot_idx'] * SLOT_DURATION_SEC
+             # Estimate bits if missing? Or just leave null.
+             if 'bits' not in full_df.columns:
+                 full_df['bits'] = full_df['rxPackets'] * 8 * 1500 # Approx MTU size
+        
+    elif pl_frames:
+        # Fallback to simple logic
+        pl_df = pd.concat(pl_frames, ignore_index=True)
+        pl_df['congestion_score'] = 0.5 * (pl_df['packet_loss'] > 0).astype(float) # Binary congestion
+        
+        if full_df is not None:
+            full_df = pd.merge(full_df, pl_df, on=['cell_id', 'slot_idx'], how='left')
+        else:
+            full_df = pl_df
+            full_df['time'] = full_df['slot_idx'] * SLOT_DURATION_SEC
+            full_df['bits'] = 0
+            
+    # Final Cleanup
+    if full_df is not None:
+        full_df.fillna(0, inplace=True)
+        # Ensure Score is Present
+        if 'congestion_score' not in full_df.columns:
+            full_df['congestion_score'] = 0.0
+            
     return full_df
 
 def calculate_capacity_with_buffer(traffic_gbps, buffer_symbols, max_loss_pct=1.0):
@@ -226,12 +344,23 @@ def calculate_capacity_with_buffer(traffic_gbps, buffer_symbols, max_loss_pct=1.
     
     return best_c
 
-def recommend_link_speed(required_gbps):
-    """Returns recommended Ethernet link speed."""
+def recommend_link_speed(required_gbps, peak_gbps=None):
+    """Returns recommended Ethernet link speed with safety guardrails."""
     for speed in LINK_SPEEDS:
-        if required_gbps <= speed * 0.8:  # 80% utilization threshold
+        # Constraint 1: Optimized capacity must fit within 80% utilization
+        capacity_ok = required_gbps <= speed * 0.8
+        
+        # Constraint 2: Peak traffic shouldn't exceed link speed (Strict Physical Limit)
+        # User Feedback: Even if buffer handles it, seeing Peak (2.89G) > Speed (2.5G) is alarming.
+        # We enforce Link Speed >= Peak to ensure absolute burst headroom.
+        peak_ok = True
+        if peak_gbps is not None:
+             if peak_gbps > speed * 1.0:
+                 peak_ok = False
+        
+        if capacity_ok and peak_ok:
             return speed
-    return 100  # Fallback
+    return 400  # Fallback
 
 def calculate_sla_score(traffic_gbps, capacity_gbps):
     """Calculate SLA compliance score (0-100)."""
@@ -398,7 +527,7 @@ st.markdown("""
 
 # --- SIDEBAR ---
 with st.sidebar:
-    st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/8/81/Nokia_wordmark.svg/320px-Nokia_wordmark.svg.png", width=120)
+    st.image("assets/nokia_logo.jpg", width=200)
     st.markdown("---")
     
     st.header("📁 Data Input")
@@ -441,14 +570,42 @@ with st.sidebar:
         step=0.1,
         help="Maximum slot loss tolerance"
     )
+
+    target_num_links = st.slider(
+        "Target Number of Links",
+        min_value=1,
+        max_value=12,
+        value=3,
+        step=1,
+        help="Hard constraint: Force network into N links (Default: 3 for Challenge)"
+    )
     
     st.markdown("---")
-    st.header("🎛️ View Mode")
-    view_mode = st.radio(
-        "Dashboard Mode",
-        ["Executive", "Engineering"],
-        help="Executive: Cost-focused | Engineering: Technical details"
-    )
+    with st.expander("💰 Cost Configuration (INR)", expanded=False):
+        st.caption("Update estimated CAPEX per link type")
+        cost_1g = st.number_input("1G Link Cost", value=45000, step=5000)
+        cost_2_5g = st.number_input("2.5G Link Cost (AirScale)", value=85000, step=5000)
+        cost_5g = st.number_input("5G Link Cost (AirScale)", value=125000, step=10000)
+        cost_10g = st.number_input("10G Link Cost", value=170000, step=10000)
+        cost_25g = st.number_input("25G Link Cost", value=680000, step=25000)
+        cost_40g = st.number_input("40G Link Cost", value=1275000, step=50000)
+        cost_50g = st.number_input("50G Link Cost (7250 IXR)", value=1500000, step=50000)
+        cost_100g = st.number_input("100G Link Cost", value=2975000, step=100000)
+        cost_400g = st.number_input("400G Link Cost", value=8500000, step=250000)
+        
+        license_cost_per_gbps = st.number_input("vRAN License Cost (per Gbps)", value=25000, step=1000, help="Software license cost savings per Gbps reduced")
+        
+        custom_link_costs = {
+            1: cost_1g,
+            2.5: cost_2_5g,
+            5: cost_5g,
+            10: cost_10g,
+            25: cost_25g,
+            40: cost_40g,
+            50: cost_50g,
+            100: cost_100g,
+            400: cost_400g
+        }
     
     st.markdown("---")
     st.header("📊 Scenario")
@@ -480,9 +637,22 @@ else:
     # LOAD & PROCESS
     with st.spinner("🔄 Processing high-resolution telemetry data..."):
         df = load_data(uploaded_files)
-    
+        
     if df is not None:
-        df['link_id'] = df['cell_id'].map(DEFAULT_MAPPING).fillna("Unmapped")
+        # Calculate cell-level Gbps (Required for Simulation & Analysis)
+        df['gbps'] = (df['bits'] / SLOT_DURATION_SEC) / GBPS_SCALE
+        
+        # Dynamic Cluster Mapping (Ensures user-defined number of links)
+        unique_cells = sorted(df['cell_id'].unique())
+        # Split cells into exactly 'target_num_links' chunks
+        chunks = np.array_split(unique_cells, target_num_links) 
+        
+        dynamic_mapping = {}
+        for i, chunk in enumerate(chunks):
+            for cell in chunk:
+                dynamic_mapping[cell] = f"Link_{i+1}"
+        
+        df['link_id'] = df['cell_id'].map(dynamic_mapping)
         
         # Aggregate to link level
         link_traffic = df.groupby(['link_id', 'slot_idx'])['bits'].sum().reset_index()
@@ -491,16 +661,21 @@ else:
         links = sorted([l for l in link_traffic['link_id'].unique() if l != "Unmapped"])
         
         # TABS
-        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
             "📊 Executive Dashboard", 
             "🔬 Engineering Analysis", 
             "💡 Recommendations",
             "🤖 AI Insights",
-            "🧬 Generative Topology",
-            "🎬 Digital Twin"
+            "🌌 3D Topology"
         ])
         
         with tab1:
+            # Data Source Check
+            has_throughput = 'type' in df.columns and (df['type'].isin(['throughput', 'detailed_stats'])).any()
+            if has_throughput:
+                st.success("✅ **Data Source: Throughput Telemetry** (Using `throughput-*.dat` for capacity planning)")
+            else:
+                st.error("⚠️ **Data Source: Packet Logs Only** (Upload `throughput-*.dat` to see Capacity/CAPEX metrics)")
             st.markdown("### 📈 Network Capacity KPIs")
             
             # Scenario multiplier for worst-case
@@ -526,7 +701,7 @@ else:
                 optimized = calculate_capacity_with_buffer(adjusted_gbps, buffer_symbols, max_loss)
                 
                 # Recommendations
-                recommended_speed = recommend_link_speed(optimized)
+                recommended_speed = recommend_link_speed(optimized, peak_gbps=peak)
                 peak_speed = recommend_link_speed(peak)  # What you'd need with peak provisioning
                 sla_score = calculate_sla_score(adjusted_gbps, optimized)
                 
@@ -535,9 +710,17 @@ else:
                 capex_pct_saving = ((peak - optimized) / peak) * 100
                 
                 # B) Dollar CAPEX savings (link tier difference)
-                peak_cost = LINK_COSTS.get(peak_speed, 35000)
-                opt_cost = LINK_COSTS.get(recommended_speed, 8000)
-                dollar_saved = peak_cost - opt_cost
+                peak_cost = custom_link_costs.get(peak_speed, cost_100g)
+                opt_cost = custom_link_costs.get(recommended_speed, cost_25g)
+                
+                # Hardware Savings
+                hw_saved = peak_cost - opt_cost
+                
+                # Software/License Savings (Volume based)
+                # Even if link tier doesn't change, we save on processing licenses
+                sw_saved = (peak - optimized) * license_cost_per_gbps
+                
+                dollar_saved = hw_saved + sw_saved
                 total_capex_saved += dollar_saved
                 
                 # C) Annual OPEX savings (power + cooling estimate)
@@ -565,28 +748,13 @@ else:
                     sla_text = "LOW"
                 
                 with st.expander(f"**{link}** - Recommended: **{recommended_speed}G Ethernet**", expanded=True):
-                    # Mode-dependent display
-                    if view_mode == "Executive":
-                        # Row 1: Main metrics
-                        col1, col2, col3, col4 = st.columns(4)
-                        col1.metric("Optimal Capacity", f"{optimized:.2f} Gbps", f"-{capex_pct_saving:.1f}% vs peak")
-                        col2.metric("Link Speed", f"{recommended_speed}G", f"vs {peak_speed}G peak")
-                        col3.metric("CAPEX Saved", f"₹{dollar_saved:,}", f"{capex_pct_saving:.0f}% reduction")
-                        col4.metric("SLA Score", f"{sla_score:.1f}%", sla_text)
-                        
-                        # Row 2: Additional cost metrics
-                        col5, col6, col7, col8 = st.columns(4)
-                        col5.metric("Peak Capacity", f"{peak:.2f} Gbps")
-                        col6.metric("Capacity Reduction", f"{capacity_reduction:.1f}%")
-                        col7.metric("Annual OPEX Saved", f"₹{annual_opex_saved:,.0f}/yr")
-                        col8.metric("Total Savings (5yr)", f"₹{dollar_saved + annual_opex_saved*5:,.0f}")
-                    else:
-                        col1, col2, col3, col4, col5 = st.columns(5)
-                        col1.metric("Peak Load", f"{peak:.2f} Gbps")
-                        col2.metric(f"P{percentile}", f"{p_val:.2f} Gbps")
-                        col3.metric("Buffer-Optimized", f"{optimized:.2f} Gbps", f"-{((p_val-optimized)/p_val)*100:.1f}%")
-                        col4.metric("CAPEX Avoided", f"{capex_pct_saving:.1f}%")
-                        col5.metric("SLA Compliance", f"{sla_score:.1f}%", sla_text)
+                    # Unified Dashboard View
+                    col1, col2, col3, col4, col5 = st.columns(5)
+                    col1.metric("Optimal Capacity", f"{optimized:.2f} Gbps", f"-{capex_pct_saving:.1f}%")
+                    col2.metric("Peak Load", f"{peak:.2f} Gbps", f"{peak_speed}G req.")
+                    col3.metric("Rec. Speed", f"{recommended_speed}G", f"vs causing {p_val:.2f}G P99") 
+                    col4.metric("CAPEX Saved", f"₹{dollar_saved:,}", f"{capex_pct_saving:.0f}%")
+                    col5.metric("SLA Score", f"{sla_score:.1f}%", sla_text)
                     
                     
                     # Traffic Timeline
@@ -621,53 +789,52 @@ else:
                     
                     st.plotly_chart(fig, use_container_width=True)
             
-            # Total CAPEX Summary (Executive Mode)
-            if view_mode == "Executive":
-                st.markdown("---")
-                
-                # Summary cards
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.markdown(f"""
-                    <div style="background: linear-gradient(135deg, #124191 0%, #1976D2 100%); 
-                                padding: 25px; border-radius: 12px; color: white; text-align: center;">
-                        <h4 style="margin: 0; opacity: 0.9;">💰 CAPEX Saved</h4>
-                        <p style="font-size: 36px; margin: 10px 0; font-weight: bold;">₹{total_capex_saved:,}</p>
-                        <p style="font-size: 14px; opacity: 0.8;">Link hardware savings</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with col2:
-                    st.markdown(f"""
-                    <div style="background: linear-gradient(135deg, #00A968 0%, #00D084 100%); 
-                                padding: 25px; border-radius: 12px; color: white; text-align: center;">
-                        <h4 style="margin: 0; opacity: 0.9;">⚡ Annual OPEX Saved</h4>
-                        <p style="font-size: 36px; margin: 10px 0; font-weight: bold;">₹{total_opex_saved:,.0f}/yr</p>
-                        <p style="font-size: 14px; opacity: 0.8;">Power & cooling reduction</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with col3:
-                    avg_capacity_reduction = total_capacity_reduction / len(links) if links else 0
-                    st.markdown(f"""
-                    <div style="background: linear-gradient(135deg, #F7931E 0%, #FF6B35 100%); 
-                                padding: 25px; border-radius: 12px; color: white; text-align: center;">
-                        <h4 style="margin: 0; opacity: 0.9;">📉 Avg Capacity Reduction</h4>
-                        <p style="font-size: 36px; margin: 10px 0; font-weight: bold;">{avg_capacity_reduction:.1f}%</p>
-                        <p style="font-size: 14px; opacity: 0.8;">Peak vs optimized provisioning</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                # 5-year TCO
-                five_year_savings = total_capex_saved + (total_opex_saved * 5)
+            # Total CAPEX Summary
+            st.markdown("---")
+            
+            # Summary cards
+            col1, col2, col3 = st.columns(3)
+            with col1:
                 st.markdown(f"""
-                <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
-                            padding: 20px; border-radius: 12px; color: white; text-align: center; margin-top: 20px;">
-                    <h3 style="margin: 0;">🚀 5-Year Total Cost of Ownership (TCO) Savings</h3>
-                    <p style="font-size: 48px; margin: 15px 0; font-weight: bold; color: #00D084;">₹{five_year_savings:,.0f}</p>
-                    <p style="opacity: 0.8;">Across {len(links)} optimized fronthaul links</p>
+                <div style="background: linear-gradient(135deg, #124191 0%, #1976D2 100%); 
+                            padding: 25px; border-radius: 12px; color: white; text-align: center;">
+                    <h4 style="margin: 0; opacity: 0.9;">💰 CAPEX Saved</h4>
+                    <p style="font-size: 36px; margin: 10px 0; font-weight: bold;">₹{total_capex_saved:,.0f}</p>
+                    <p style="font-size: 14px; opacity: 0.8;">HW + vRAN License savings</p>
                 </div>
                 """, unsafe_allow_html=True)
+            
+            with col2:
+                st.markdown(f"""
+                <div style="background: linear-gradient(135deg, #00A968 0%, #00D084 100%); 
+                            padding: 25px; border-radius: 12px; color: white; text-align: center;">
+                    <h4 style="margin: 0; opacity: 0.9;">⚡ Annual OPEX Saved</h4>
+                    <p style="font-size: 36px; margin: 10px 0; font-weight: bold;">₹{total_opex_saved:,.0f}/yr</p>
+                    <p style="font-size: 14px; opacity: 0.8;">Power & cooling reduction</p>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            with col3:
+                avg_capacity_reduction = total_capacity_reduction / len(links) if links else 0
+                st.markdown(f"""
+                <div style="background: linear-gradient(135deg, #F7931E 0%, #FF6B35 100%); 
+                            padding: 25px; border-radius: 12px; color: white; text-align: center;">
+                    <h4 style="margin: 0; opacity: 0.9;">📉 Avg Capacity Reduction</h4>
+                    <p style="font-size: 36px; margin: 10px 0; font-weight: bold;">{avg_capacity_reduction:.1f}%</p>
+                    <p style="font-size: 14px; opacity: 0.8;">Peak vs optimized provisioning</p>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            # 5-year TCO
+            five_year_savings = total_capex_saved + (total_opex_saved * 5)
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
+                        padding: 20px; border-radius: 12px; color: white; text-align: center; margin-top: 20px;">
+                <h3 style="margin: 0;">🚀 5-Year Total Cost of Ownership (TCO) Savings</h3>
+                <p style="font-size: 48px; margin: 15px 0; font-weight: bold; color: #00D084;">₹{five_year_savings:,.0f}</p>
+                <p style="opacity: 0.8;">Across {len(links)} optimized fronthaul links</p>
+            </div>
+            """, unsafe_allow_html=True)
         
         
         with tab2:
@@ -719,7 +886,7 @@ else:
                 peak = np.max(data)
                 p_val = np.percentile(data, percentile)
                 opt = calculate_capacity_with_buffer(data, buffer_symbols, max_loss)
-                rec_speed = recommend_link_speed(opt)
+                rec_speed = recommend_link_speed(opt, peak_gbps=peak)
                 saving = ((peak - opt) / peak) * 100
                 sla = calculate_sla_score(data, opt)
                 
@@ -748,14 +915,60 @@ else:
                 except:
                     rec_text = f"Deploy {rec_speed}G Ethernet link for optimal cost-performance. Required capacity: {opt:.2f} Gbps with {saving:.1f}% CAPEX savings vs peak provisioning."
                 
-                st.markdown(f"""
-                <div class="recommendation-box">
-                    <h3 style="margin-top: 0;">🎯 {link} → Deploy {rec_speed}G Ethernet</h3>
-                    <p style="font-size: 16px; line-height: 1.6;">{rec_text}</p>
-                    <hr style="border-color: rgba(255,255,255,0.3); margin: 15px 0;">
-                    <p style="font-size: 14px; opacity: 0.9;"><strong>Key Metrics:</strong> Peak: {peak:.2f} Gbps | Optimized: {opt:.2f} Gbps | SLA: {sla:.1f}% | CAPEX Saved: {saving:.1f}%</p>
-                </div>
-                """, unsafe_allow_html=True)
+                # Extended Metrics
+                avg_traffic = np.mean(data)
+                std_traffic = np.std(data)
+                utilization = (avg_traffic / opt) * 100 if opt > 0 else 0
+                burstiness = (std_traffic / avg_traffic) * 100 if avg_traffic > 0 else 0
+                congestion_risk = "HIGH" if burstiness > 50 else ("MEDIUM" if burstiness > 30 else "LOW")
+                
+                # Cost estimation
+                cost_map = custom_link_costs
+                peak_cost_tier = recommend_link_speed(peak)
+                peak_capex = cost_map.get(peak_cost_tier, 100000)
+                opt_capex = cost_map.get(rec_speed, 100000)
+                rupee_saving = peak_capex - opt_capex
+                
+                with st.expander(f"🎯 **{link}** → Deploy **{rec_speed}G Ethernet**", expanded=True):
+                    # Written Explanation
+                    st.markdown(f"""
+                    #### 📝 Data Analysis Summary
+                    
+                    **What the data shows:**
+                    - This link aggregates traffic from **8 cell sites** in the fronthaul network.
+                    - Over the measurement period, we collected **{len(data):,} time slots** of throughput telemetry.
+                    - The traffic pattern shows an **average of {avg_traffic:.2f} Gbps** with peaks reaching **{peak:.2f} Gbps**.
+                    - Traffic variability (burstiness) is **{burstiness:.0f}%**, indicating {'highly variable traffic that requires buffer management' if burstiness > 50 else 'moderate traffic variations' if burstiness > 30 else 'stable, predictable traffic patterns'}.
+                    
+                    #### 💡 What This Recommendation Means
+                    
+                    **Traditional Approach (Peak Provisioning):**
+                    - Would deploy a **{peak_cost_tier}G link** to handle the absolute peak of {peak:.2f} Gbps.
+                    - Cost: **₹{peak_capex:,}** per link.
+                    - Problem: The link sits idle most of the time (only {utilization:.0f}% average utilization).
+                    
+                    **Our AI-Optimized Approach (Statistical Multiplexing):**
+                    - Deploys a **{rec_speed}G link** with intelligent buffer management ({buffer_symbols} symbols).
+                    - Uses the fact that all cells don't peak simultaneously.
+                    - Achieves **{sla:.1f}% SLA** (packet delivery guarantee) with lower capacity.
+                    - Cost: **₹{opt_capex:,}** per link.
+                    
+                    **Net Savings: ₹{rupee_saving:,}** ({saving:.1f}% reduction in CAPEX)
+                    """)
+                    
+                    # Metrics Row
+                    st.markdown("#### 📊 Key Metrics")
+                    m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+                    m_col1.metric("Peak Traffic", f"{peak:.2f} Gbps")
+                    m_col2.metric("Optimized Capacity", f"{opt:.2f} Gbps")
+                    m_col3.metric("Avg Utilization", f"{utilization:.0f}%")
+                    m_col4.metric("Congestion Risk", congestion_risk, delta=None)
+                    
+                    # Risk Assessment
+                    if congestion_risk == "HIGH":
+                        st.warning("⚠️ **High Burstiness Alert:** Consider increasing buffer size or deploying QoS policies.")
+                    elif congestion_risk == "LOW":
+                        st.success("✅ **Stable Traffic:** Low risk of congestion events.")
             
             
             # Download Report Section
@@ -810,6 +1023,47 @@ else:
             # API Key
             api_key = "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"
             
+            # Network Overview Section
+            st.markdown("#### 📊 Network Overview")
+            
+            total_cells = len(df['cell_id'].unique())
+            total_slots = len(df['slot_idx'].unique())
+            total_traffic = df['bits'].sum() / 1e12  # Terabits
+            avg_packet_loss = df['packet_loss'].mean() if 'packet_loss' in df.columns else 0
+            
+            ov_col1, ov_col2, ov_col3, ov_col4 = st.columns(4)
+            ov_col1.metric("Total Cells", f"{total_cells}")
+            ov_col2.metric("Time Slots", f"{total_slots:,}")
+            ov_col3.metric("Total Traffic", f"{total_traffic:.2f} Tb")
+            ov_col4.metric("Avg Packet Loss", f"{avg_packet_loss:.2f}")
+            
+            st.markdown("---")
+            
+            # Per-Link Summary Table
+            st.markdown("#### 📋 Link-by-Link Analysis")
+            
+            summary_data = []
+            for link in links:
+                data = link_traffic[link_traffic['link_id'] == link]['gbps'].values
+                cells_in_link = df[df['link_id'] == link]['cell_id'].nunique()
+                opt_capacity = calculate_capacity_with_buffer(data, buffer_symbols, max_loss)
+                rec_speed = recommend_link_speed(opt_capacity, peak_gbps=peak)
+                peak = np.max(data)
+                saving = ((peak - opt_capacity) / peak) * 100 if peak > 0 else 0
+                
+                summary_data.append({
+                    "Link": link,
+                    "Cells": cells_in_link,
+                    "Peak (Gbps)": f"{peak:.2f}",
+                    "Optimized (Gbps)": f"{opt_capacity:.2f}",
+                    "Recommendation": f"{rec_speed}G",
+                    "CAPEX Saving": f"{saving:.1f}%"
+                })
+            
+            summary_df = pd.DataFrame(summary_data)
+            st.dataframe(summary_df, use_container_width=True, hide_index=True)
+            
+            st.markdown("---")
             st.markdown(f"**Analyzing {len(links)} links:** {', '.join(links)}")
             
             if st.button("🚀 Generate CTO Report for All Links", type="primary"):
@@ -824,7 +1078,7 @@ else:
                         'peak': np.max(data),
                         'p99': np.percentile(data, 99),
                         'optimized': opt_capacity,
-                        'recommended_speed': recommend_link_speed(opt_capacity),
+                        'recommended_speed': recommend_link_speed(opt_capacity, peak_gbps=np.max(data)),
                         'capex_saving': ((np.max(data) - opt_capacity) / np.max(data)) * 100
                     }
                     
@@ -839,159 +1093,150 @@ else:
                 
                 progress.empty()
                 
-                # Display all results
+                # Display all results with enhanced styling
+                st.markdown("#### 🎯 AI-Generated Recommendations")
                 for link, result in ai_results.items():
-                    st.markdown(f"#### {link} - AI Analysis")
-                    st.info(result)
+                    with st.expander(f"📌 {link} - Detailed AI Analysis", expanded=True):
+                        st.markdown(result)
+                        
+                        # Add quick metrics
+                        data = link_traffic[link_traffic['link_id'] == link]['gbps'].values
+                        qc1, qc2, qc3 = st.columns(3)
+                        qc1.metric("Peak Traffic", f"{np.max(data):.2f} Gbps")
+                        qc2.metric("Average", f"{np.mean(data):.2f} Gbps")
+                        qc3.metric("Utilization", f"{(np.mean(data)/np.max(data))*100:.0f}%")
 
         with tab5:
-            st.markdown("### 🧬 Generative AI Topology Optimization")
-            st.markdown("""
-            > **The "Crazy" Idea:** Why accept the network as it is? 
-            > This engine uses **Generative AI Logic** to brute-force thousands of network permutations, 
-            > finding the perfect statistical multiplexing alignment to minimize CAPEX.
-            """)
+            st.markdown("### 🌌 3D Immersive Topology")
+            st.markdown("Interactive 3D visualization of the network hierarchy. **Drag to rotate, Scroll to zoom.**")
             
-            st.info("Current Configuration: Standard Mapping (Based on geography/legacy)")
+            # Prepare Data
+            congestion_state = sim_utils.prepare_congestion_data(df)
             
-            # Calculate current cost
-            curr_cost, curr_details = calculate_topology_cost(df, DEFAULT_MAPPING)
-            
-            col1, col2 = st.columns(2)
-            col1.metric("Current Network CAPEX", f"₹{curr_cost:,}")
-            
-            if 'topo_opt_results' not in st.session_state:
-                st.session_state.topo_opt_results = None
+            # Show Data Source Indicator
+            has_real_packets = 'packet_loss' in df.columns and df['packet_loss'].max() > 0
+            if has_real_packets:
+                st.info("📡 **Data Source: Real Packet Loss Logs** (Red/Orange highlights determined by actual `pkt.dat` files)")
+            else:
+                st.warning("📉 **Data Source: Throughput Estimation** (Packet loss simulated based on bandwidth thresholds)")
 
-            if st.button("✨ Run Generative Topology Engine", type="primary"):
-                with st.spinner("🤖 AI is redesigning the physical network layer..."):
-                    # Run Optimization (Reduced iterations for speed)
-                    best_mapping, best_cost, best_details = optimize_topology(df, iterations=50)
-                    
-                    # Store in session state
-                    st.session_state.topo_opt_results = {
-                        'mapping': best_mapping,
-                        'cost': best_cost,
-                        'details': best_details
-                    }
-                    
-            # Display Results from Session State
-            if st.session_state.topo_opt_results:
-                results = st.session_state.topo_opt_results
-                best_cost = results['cost']
-                best_mapping = results['mapping']
-                best_details = results['details']
-                
-                # Calculate Savings
-                savings = curr_cost - best_cost
-                savings_pct = (savings / curr_cost) * 100
-                
-                st.success(f"🎉 Optimization Complete! Found a design saving ₹{savings:,} ({savings_pct:.1f}%)")
-                
-                # Visualization
-                scol1, scol2 = st.columns(2)
-                with scol1:
-                    st.metric("Optimized CAPEX", f"₹{best_cost:,}", f"-{savings_pct:.1f}%")
-                with scol2:
-                        st.metric("Total Savings", f"₹{savings:,}")
-                
-                # Show Mapping
-                st.subheader("Recommended Network Re-Architechture")
-                
-                mapping_df = pd.DataFrame(list(best_mapping.items()), columns=['Cell ID', 'New Link Assignment'])
-                mapping_df = mapping_df.sort_values('New Link Assignment')
-                
-                st.dataframe(mapping_df, use_container_width=True)
-                
-                # Detailed breakdown
-                st.write("### Link Distribution")
-                for link_id, det in best_details.items():
-                    st.write(f"**{link_id}**: Peak {det['peak']:.2f} Gbps → Requires **{det['speed']}G Link** (₹{det['cost']:,})")
-
-        with tab6:
-            st.markdown("### 🎬 Network Digital Twin Simulation")
-            st.markdown("Visualize minute-by-minute packet flow and buffer stress in **Time-Travel Mode**.")
+            min_slot = int(congestion_state.index.min())
+            max_slot = int(congestion_state.index.max())
             
-            if st.button("▶️ Start Live Simulation", type="primary"):
-                # Simulation Logic
-                st.write("Initializing Digital Twin Environment...")
+            # --- AUTO-DETECT CONGESTION ---
+            # Find slots where any cell has congestion level > 0
+            # congestion_state is a DF: Index=Slot, Cols=Cells, Val=Level
+            hot_slots = congestion_state[congestion_state.max(axis=1) > 0].index.tolist()
+            
+            selected_slot = min_slot
+            
+            if hot_slots:
+                st.warning(f"🚨 Detected {len(hot_slots)} Congestion Events!")
                 
-                # Create columns for links
-                sim_cols = st.columns(len(links))
-                placeholders = []
+                # Format options for the dropdown
+                # Show first congested cell info for context
+                event_options = []
+                for s in hot_slots:
+                    # Find which cells are hot in this slot
+                    row = congestion_state.loc[s]
+                    hot_cells = row[row > 0].index.tolist()
+                    details = f"Slot {s}: {len(hot_cells)} Issues (Cells {hot_cells[:2]}...)"
+                    event_options.append((s, details))
                 
-                # Setup UI containers
-                for idx, link in enumerate(links):
-                    with sim_cols[idx]:
-                        st.markdown(f"#### {link}")
-                        container = st.empty()
-                        placeholders.append(container)
-                        
-                # Prepare Data for Playback (Sampling for speed)
-                frames = 20 # Reduced from 100 for faster loading
-                import time
+                # Dropdown Selection
+                choice_idx = st.selectbox(
+                    "🔍 **Jump to Congestion Event:**", 
+                    range(len(event_options)), 
+                    format_func=lambda i: event_options[i][1]
+                )
+                selected_slot = event_options[choice_idx][0]
                 
-                # Pre-calculate data slices
-                link_data_map = {}
-                for link in links:
-                    series = link_traffic[link_traffic['link_id'] == link]['gbps'].values
-                    # Downsample to 'frames' chunks
-                    step = len(series) // frames
-                    if step < 1: step = 1
-                    sampled = series[::step]
-                    link_data_map[link] = sampled
-                
-                # Animation Loop
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                total_loss_events = 0
-                
-                for f in range(len(link_data_map[links[0]])):
-                    
-                    status_text.text(f"Simulation Time Step: {f} / {frames}")
-                    
-                    # Update each link
-                    for idx, link in enumerate(links):
-                        val = link_data_map[link][f]
-                        
-                        # Dynamic Threshold (using the Optimization from earlier)
-                        # We'll use a fixed 25G reference for visual drama if not available
-                        capacity_limit = 25.0 
-                        
-                        load_pct = (val / capacity_limit) * 100
-                        buffer_fill = 0
-                        if load_pct > 100:
-                            buffer_fill = min((load_pct - 100) * 5, 100) # Exaggerate buffer fill
-                            if buffer_fill == 100:
-                                total_loss_events += 1
-                        
-                        # Color Logic
-                        if buffer_fill > 90:
-                            color = "red"
-                            status = "CRITICAL"
-                        elif buffer_fill > 50:
-                            color = "orange"
-                            status = "BUFFERING"
-                        else:
-                            color = "green"
-                            status = "HEALTHY"
-                            
-                        # Render Frame
-                        with placeholders[idx].container():
-                            st.metric("Throughput", f"{val:.2f} Gbps")
-                            st.caption(f"Status: :{'red' if color=='red' else 'green'}[{status}]")
-                            st.progress(min(int(load_pct), 100) / 100)
-                            
-                            # Simulated Buffer Gauge
-                            st.write(f"Buffer: {buffer_fill:.0f}%")
-                            st.progress(buffer_fill / 100)
-                    
-                    progress_bar.progress((f + 1) / len(link_data_map[links[0]]))
-                    time.sleep(0.05) # 20fps
-                
-                st.success("Simulation Complete.")
-                if total_loss_events > 0:
-                    st.error(f"Detected {total_loss_events} packet loss events during stress test.")
+            else:
+                st.success("✅ No congestion detected in the entire logs.")
+                # Fallback to slider if no events
+                if min_slot < max_slot:
+                    selected_slot = st.slider("Select Simulation Time Slot (3D View)", min_slot, max_slot, min_slot)
                 else:
-                    st.balloons()
+                    selected_slot = min_slot
+
+            # Extract state for this slot
+            if selected_slot in congestion_state.index:
+                active_congestion = congestion_state.loc[selected_slot].to_dict()
+                st.caption(f"Visualizing traffic state at Slot {selected_slot}")
+            else:
+                active_congestion = {}
+                st.warning("No data for this slot.")
+            
+            # Invert dynamic mapping for 3D function: Link -> [Cells]
+            link_to_cells = {}
+            for cell, link in dynamic_mapping.items():
+                if link not in link_to_cells:
+                    link_to_cells[link] = []
+                link_to_cells[link].append(cell)
+            
+            # Determine Link-Level Congestion (Aggregated View)
+            active_link_status = {}
+            if selected_slot in link_traffic['slot_idx'].unique():
+                slot_data = link_traffic[link_traffic['slot_idx'] == selected_slot]
+                for _, row in slot_data.iterrows():
+                    l_id = row['link_id']
+                    l_gbps = row['gbps']
+                    
+                    # Define Link Congestion Thresholds (Heuristic)
+                    # Green < 3G, Orange < 5G, Red > 5G (assuming 10G link is standard, half load warning)
+                    if l_gbps > 5.0:
+                        active_link_status[l_id] = 2
+                    elif l_gbps > 3.0:
+                        active_link_status[l_id] = 1
+                    else:
+                        active_link_status[l_id] = 0
+            
+            fig_3d, congestion_report = sim_utils.generate_3d_topology(link_to_cells, active_congestion=active_congestion, active_link_status=active_link_status)
+            
+            col_3d, col_info = st.columns([3, 1])
+            
+            with col_3d:
+                st.plotly_chart(fig_3d, use_container_width=True)
+                
+            with col_info:
+                st.markdown("#### 🚨 Active Congestion Incidents")
+                if not congestion_report:
+                    st.success("✅ Network Healthy")
+                    st.caption("No congestion detected at this time slot.")
+                else:
+                    for item in congestion_report:
+                        node = item['node']
+                        level = item['level']
+                        reason = "Unknown Anomaly"
+                        
+                        # Root Cause Analysis
+                        if node.startswith("Cell "):
+                            try:
+                                cid = int(node.replace("Cell ", ""))
+                                # Lookup stats
+                                cell_stats = df[(df['cell_id'] == cid) & (df['slot_idx'] == selected_slot)]
+                                if not cell_stats.empty:
+                                    row = cell_stats.iloc[0]
+                                    if row.get('late_ratio', 0) > 0.01:
+                                        reason = f"High Latency ({(row.get('late_ratio',0)*100):.1f}% Late Packets)"
+                                    elif row.get('loss_ratio', 0) > 0.01:
+                                        reason = f"Packet Loss ({(row.get('loss_ratio',0)*100):.1f}% Dropped)"
+                                    elif row.get('gbps', 0) > 2.5:
+                                        reason = f"Bandwidth Saturation ({row.get('gbps',0):.2f} Gbps)"
+                            except:
+                                pass
+                        elif node.startswith("Link"):
+                            if node in active_link_status:
+                                 status = active_link_status[node]
+                                 if status == 2:
+                                     reason = "Link Saturation (>5 Gbps)"
+                                 elif status == 1:
+                                     reason = "Moderate Link Load"
+                        
+                        if level == 2:
+                            st.error(f"🔴 **{node}**: {reason}")
+                        elif level == 1:
+                            st.warning(f"🟠 **{node}**: {reason}")
+                            
+                    st.markdown("---")
+                    st.caption("**Root Cause Analysis:** Real-time diagnosis of link and cell telemetry.")

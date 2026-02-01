@@ -8,7 +8,8 @@ import streamlit as st
 # Cost Table (same as app.py)
 # CAPEX Cost Estimates (INR per link - Typical Operator Pricing in India)
 # Approx conversion ~85 INR/USD + taxes
-LINK_COSTS = {
+# Default values (fallback)
+DEFAULT_LINK_COSTS = {
     1: 45000,
     10: 170000,
     25: 680000,
@@ -25,7 +26,7 @@ def get_required_speed(gbps_val):
 
     return 100
 
-def calculate_topology_cost(df, mapping, slot_duration=0.0005, gbps_scale=1e9):
+def calculate_topology_cost(df, mapping, slot_duration=0.0005, gbps_scale=1e9, link_costs=None):
     """
     Calculates the total CAPEX for a given cell-to-link mapping.
     """
@@ -52,13 +53,16 @@ def calculate_topology_cost(df, mapping, slot_duration=0.0005, gbps_scale=1e9):
                 peak_gbps = (max_bits / slot_duration) / gbps_scale
             
             req_speed = get_required_speed(peak_gbps)
-            cost = LINK_COSTS[req_speed]
+            if link_costs is None:
+                link_costs = DEFAULT_LINK_COSTS
+                
+            cost = link_costs[req_speed]
             total_cost += cost
             link_details[link_id] = {'peak': peak_gbps, 'speed': req_speed, 'cost': cost}
             
     return total_cost, link_details
 
-def optimize_topology(df, num_links=3, iterations=200):
+def optimize_topology(df, num_links=3, iterations=200, link_costs=None):
     """
     Tries random permutations to find a topology with lower Total CAPEX.
     Maximizes statistical multiplexing by grouping non-overlapping peaks.
@@ -94,7 +98,7 @@ def optimize_topology(df, num_links=3, iterations=200):
             current_mapping[cell] = f"Link_{link_num}"
             
         # Calculate Cost
-        cost, details = calculate_topology_cost(df, current_mapping)
+        cost, details = calculate_topology_cost(df, current_mapping, link_costs=link_costs)
         
         if cost < best_cost:
             best_cost = cost

@@ -190,16 +190,27 @@ def main():
             MAX_LOSS_PCT
         )
         
+        # Recommendations
+        def recommend_speed(gbps):
+            for speed in [1, 2.5, 5, 10, 25, 40, 50, 100, 400]:
+                if gbps <= speed * 0.8: return speed
+            return 400 # Max supported
+
+        rec_speed = recommend_speed(req_capacity_buffer)
+        peak_speed = recommend_speed(peak)
+
         # Cost Optimization Metrics
         overprovision_pct = 0.0
         if peak > 0:
             overprovision_pct = ((peak - p99) / peak) * 100.0
-            
+
         link_results[link_id] = {
             "average_gbps": round(float(avg), 2),
             "peak_gbps": round(float(peak), 2),
             "required_99_percentile_gbps": round(float(p99), 2),
             "required_with_buffer_gbps": round(float(req_capacity_buffer), 2),
+            "recommended_link_speed_tier": rec_speed,
+            "peak_based_link_speed_tier": peak_speed,
             "overprovision_if_peak_based_percent": round(overprovision_pct, 1)
         }
 

@@ -1,0 +1,28 @@
+# Nokia Fronthaul Capacity Optimizer - Python Dependencies
+# Compatible with Python 3.8+
+
+# Core Web Framework
+streamlit>=1.28.0
+
+# Data Processing & Analysis
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Visualization
+plotly>=5.17.0
+
+# AI & Machine Learning
+openai>=1.0.0
+
+# PDF Report Generation
+reportlab>=4.0.0
+
+# Network Analysis & Graph Processing
+networkx>=3.1
+
+# Additional Utilities
+python-dateutil>=2.8.2
+
+# Optional: For enhanced performance
+# pyarrow>=13.0.0  # Fast data processing
+# numba>=0.58.0    # JIT compilation for numerical code
