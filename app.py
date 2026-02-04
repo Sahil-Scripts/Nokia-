@@ -877,7 +877,7 @@ else:
             report_data = []
             
             # API Key for AI recommendations
-            api_key = "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"
+            api_key = "OPEN_AI_APIKEY"
             
             st.markdown("*AI-powered recommendations are being generated...*")
             
@@ -1240,3 +1240,4 @@ else:
                             
                     st.markdown("---")
                     st.caption("**Root Cause Analysis:** Real-time diagnosis of link and cell telemetry.")
+
